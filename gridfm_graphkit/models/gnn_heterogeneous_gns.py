@@ -1,6 +1,10 @@
+import math
+
 import torch
 from torch import nn
 from torch_geometric.nn import HeteroConv, TransformerConv
+
+from gridfm_graphkit.models.coed_transformer_conv import CoEDTransformerConv
 from gridfm_graphkit.io.registries import MODELS_REGISTRY
 from gridfm_graphkit.io.param_handler import get_physics_decoder
 from torch_scatter import scatter_add
@@ -50,6 +54,58 @@ class GNS_heterogeneous(nn.Module):
         self.task = args.task.task_name
         self.dropout = getattr(args.model, "dropout", 0.0)
 
+        # --- CoED (Continuous Edge Directions) --------------------------------
+        # One angle per undirected branch, per layer.  Per-layer is deliberate,
+        # not an option: the projected edge representation is built once outside
+        # the layer loop, so a single shared theta would apply the same prior at
+        # every layer and compound with depth.
+        #
+        # theta is parameterised as theta = (pi/2) * sigmoid(theta_raw) rather
+        # than clamped.  This keeps it inside [0, pi/2] by construction, so no
+        # post-step projection hook is needed and the module stays usable from
+        # any training loop.  theta_raw = 0 gives exactly theta = pi/4, where
+        # log(cos^2) == log(sin^2) is a constant on every edge and cancels in
+        # the softmax: CoED is then provably a no-op, so epoch 0 matches the
+        # baseline bit for bit.  Weight decay on theta_raw pulls towards 0, i.e.
+        # towards that neutral angle, so it needs no special parameter group.
+        self.coed = getattr(args.model, "coed", False)
+        self.num_undirected_branches = getattr(
+            args.model,
+            "num_undirected_branches",
+            None,
+        )
+        # How the two directed copies of a branch are ordered in edge_index:
+        #   "contiguous"  -> [all forward, all reverse]   (one block-diagonal
+        #                    mega-graph, e.g. the PPC parquet adapter)
+        #   "interleaved" -> [fwd, rev] per graph, repeated (PyG's own
+        #                    DataLoader collating one HeteroData per scenario)
+        # There is no safe default: picking the wrong one binds theta to the
+        # wrong branches *silently*, which reads as a null result rather than an
+        # error, so it must be stated explicitly.
+        self.coed_edge_order = getattr(args.model, "coed_edge_order", None)
+        if self.coed:
+            if not self.num_undirected_branches:
+                raise ValueError(
+                    "model.coed is enabled but model.num_undirected_branches is "
+                    "unset. CoED needs one angle per undirected branch, so the "
+                    "branch count of the single fixed topology must be known up "
+                    "front.",
+                )
+            if self.coed_edge_order not in ("contiguous", "interleaved"):
+                raise ValueError(
+                    "model.coed requires model.coed_edge_order to be either "
+                    "'contiguous' ([all forward, all reverse], as the PPC "
+                    "parquet adapter builds it) or 'interleaved' ([fwd, rev] per "
+                    "graph, as PyG's DataLoader builds it). Guessing wrong binds "
+                    f"theta to the wrong branches without error; got "
+                    f"{self.coed_edge_order!r}.",
+                )
+            self.theta_raw = nn.Parameter(
+                torch.zeros(self.num_layers, self.num_undirected_branches),
+            )
+        else:
+            self.theta_raw = None
+
         # projections for each node type
         self.input_proj_bus = nn.Sequential(
             nn.Linear(self.input_bus_dim, self.hidden_dim),
@@ -89,8 +145,9 @@ class GNS_heterogeneous(nn.Module):
             out_dim = self.hidden_dim  # TransformerConv will output hidden_dim (per head reduction in HeteroConv call)
 
             # relation -> conv module mapping
+            bus_bus_conv = CoEDTransformerConv if self.coed else TransformerConv
             conv_dict = {
-                ("bus", "connects", "bus"): TransformerConv(
+                ("bus", "connects", "bus"): bus_bus_conv(
                     in_bus,
                     out_dim,
                     heads=self.heads,
@@ -162,6 +219,55 @@ class GNS_heterogeneous(nn.Module):
         # container for monitoring residual norms per layer and type
         self.layer_residuals = {}
 
+    def _theta_logit(self, layer: int, num_directed_edges: int) -> torch.Tensor:
+        """Per-directed-edge log directional weight for one layer.
+
+        CoED gives each undirected branch an angle ``theta`` whose two directed
+        copies carry complementary weights ``cos^2(theta)`` and
+        ``sin^2(theta)``, summing to one.  This returns their logs, laid out to
+        match the order the directed edges appear in ``edge_index``.
+
+        The layout depends on who built the batch, hence
+        ``model.coed_edge_order``:
+
+        * ``contiguous`` -- the branch list of the whole batch is traversed once
+          forward and once in reverse, giving ``[all forward, all reverse]``.
+          This is what the PPC parquet adapter produces, because it assembles
+          one block-diagonal mega-graph per batch.
+        * ``interleaved`` -- each graph contributes its own
+          ``[forward, reverse]`` block and the blocks are concatenated, giving
+          ``[fwd_1, rev_1, fwd_2, rev_2, ...]``.  This is what PyG's own
+          ``DataLoader`` produces from one ``HeteroData`` per scenario.
+
+        Using the wrong one misplaces half the edges and raises nothing, so the
+        divisibility check below is the only guard against a batch whose branch
+        count does not match ``num_undirected_branches`` -- which also catches
+        out-of-service branches (the adapter drops dead edges, so the count
+        shrinks) and batches that mix topologies.
+        """
+        theta = (math.pi / 2.0) * torch.sigmoid(self.theta_raw[layer])
+        cos2 = torch.cos(theta).pow(2).clamp(min=1e-8)
+        sin2 = torch.sin(theta).pow(2).clamp(min=1e-8)
+        log_cos2, log_sin2 = cos2.log(), sin2.log()
+
+        n_branches = log_cos2.numel()
+        if num_directed_edges % (2 * n_branches) != 0:
+            raise ValueError(
+                f"CoED needs one fixed, fully in-service topology per batch: got "
+                f"{num_directed_edges} directed bus-bus edges, which is not a "
+                f"multiple of 2 * num_undirected_branches = {2 * n_branches}. "
+                f"Causes: a batch mixing networks with different branch counts, "
+                f"out-of-service branches dropped by the edge builder, or a "
+                f"mismatched model.num_undirected_branches.",
+            )
+        n_graphs = num_directed_edges // (2 * n_branches)
+
+        if self.coed_edge_order == "contiguous":
+            # [all forward, all reverse] over the concatenated branch list.
+            return torch.cat([log_cos2.repeat(n_graphs), log_sin2.repeat(n_graphs)])
+        # [fwd, rev] per graph, that block repeated once per graph.
+        return torch.cat([log_cos2, log_sin2]).repeat(n_graphs)
+
     def forward(self, batch, return_embeddings: bool = False):
         """
         Accepts a PyG HeteroData batch and extracts the required tensors.
@@ -209,11 +315,21 @@ class GNS_heterogeneous(nn.Module):
         gen_fixed = x_dict["gen"][:, : (PG_H + 1)]
 
         # iterate layers
+        num_bus_edges = bus_edge_index.size(1)
         for i, conv in enumerate(self.layers):
+            conv_kwargs = {}
+            if self.coed:
+                conv_kwargs["theta_logit_dict"] = {
+                    ("bus", "connects", "bus"): self._theta_logit(
+                        i,
+                        num_bus_edges,
+                    ),
+                }
             out_dict = conv(
                 {"bus": h_bus, "gen": h_gen},
                 edge_index_dict,
                 edge_attr_proj_dict,
+                **conv_kwargs,
             )
             out_bus = out_dict["bus"]  # [Nb, hidden_dim * heads]
             out_gen = out_dict["gen"]  # [Ng, hidden_dim * heads]
