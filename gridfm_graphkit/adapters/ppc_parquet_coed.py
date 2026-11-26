@@ -161,10 +161,34 @@ def _branch_admittance(r, x, b_fr, b_to, tap, shift):
 
 def graphkit_branch_edges(hetero, device, dtype=torch.float32
                           ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Directed bus-bus edges with the released model's 10-column attribute."""
+    """Directed bus-bus edges with the released model's 10-column attribute.
+
+    EDGE ORDER IS PART OF THE CONTRACT. The two halves are emitted as
+    ``[all forward, all reverse]`` over the concatenated branch list -- every
+    ac_line branch then every transformer branch forward, then the same list
+    again in reverse -- which is what ``coed_edge_order="contiguous"`` means and
+    what the released builder itself produces
+    (``datasets/graph_builder.py``: ``cat([forward_edges, reverse_edges])``).
+
+    Emitting relation-blocks instead, ``[ac_fwd, ac_rev, tr_fwd, tr_rev]``,
+    would put theta on the wrong edges for every grid that has transformers and
+    raise nothing: the divisibility check in ``_coed_log_weights`` still passes,
+    because the total edge count is unchanged. The two layouts coincide only on
+    a grid with no transformers, which is why this went unnoticed.
+
+    theta is therefore indexed in branch order: ac_line branches first, then
+    transformer branches, and ``num_undirected_branches`` is their sum.
+
+    The base arm is indifferent to this -- message passing is permutation
+    equivariant over edges -- so reordering changes no base result. Only CoED,
+    which indexes theta positionally, depends on it.
+    """
     from opfdata_pipeline import AC_LINE, TRAFO
 
-    src, dst, attrs = [], [], []
+    # Accumulated separately so the two halves can be concatenated in the
+    # contiguous order; appending per relation would interleave them.
+    fwd_src, fwd_dst, fwd_attr = [], [], []
+    rev_src, rev_dst, rev_attr = [], [], []
     for key, cols, is_trafo in ((("bus", "ac_line", "bus"), AC_LINE, False),
                                 (("bus", "transformer", "bus"), TRAFO, True)):
         if key not in hetero.edge_types:
@@ -191,7 +215,7 @@ def graphkit_branch_edges(hetero, device, dtype=torch.float32
 
         Yff, Yft, Ytt, Ytf = _branch_admittance(r, x, b_fr, b_to, tap, shift)
 
-        for (s_i, d_i, Yself, Ymut) in ((f, t, Yff, Yft), (t, f, Ytt, Ytf)):
+        def _attr(Yself, Ymut):
             e = np.zeros((len(r), EDGE_DIM), dtype=np.float64)
             e[:, YFF_TT_R] = Yself.real
             e[:, YFF_TT_I] = Yself.imag
@@ -201,11 +225,18 @@ def graphkit_branch_edges(hetero, device, dtype=torch.float32
             e[:, ANG_MIN] = amin
             e[:, ANG_MAX] = amax
             e[:, RATE_A] = rate
-            src.append(s_i); dst.append(d_i); attrs.append(e)
+            return e
 
-    if not attrs:
+        fwd_src.append(f); fwd_dst.append(t); fwd_attr.append(_attr(Yff, Yft))
+        rev_src.append(t); rev_dst.append(f); rev_attr.append(_attr(Ytt, Ytf))
+
+    if not fwd_attr:
         return (torch.zeros((2, 0), dtype=torch.long, device=device),
                 torch.zeros((0, EDGE_DIM), dtype=dtype, device=device))
+    # [all forward, all reverse]: forward halves of every relation first.
+    src = fwd_src + rev_src
+    dst = fwd_dst + rev_dst
+    attrs = fwd_attr + rev_attr
     ei = torch.tensor(np.stack([np.concatenate(src), np.concatenate(dst)]),
                       dtype=torch.long, device=device)
     ea = torch.tensor(np.concatenate(attrs, axis=0), dtype=dtype, device=device)
