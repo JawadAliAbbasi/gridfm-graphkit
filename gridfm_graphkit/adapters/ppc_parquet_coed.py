@@ -142,6 +142,27 @@ def build_graphkit_model(task_name="PowerFlow", hidden_size=48, num_layers=12,
 # per-branch admittance split
 # --------------------------------------------------------------------------- #
 
+def _opfdata_pipeline():
+    """The caller's opfdata_pipeline module, however it happens to be laid out.
+
+    This adapter is imported by two different trees. In PIGNN-Attn-LS-PPC
+    opfdata_pipeline.py sits at the top level, so a bare `import
+    opfdata_pipeline` resolves; in Jawad-AC-PF it lives in `src/`, so it is
+    `src.opfdata_pipeline` unless `src/` is itself on sys.path. Trying both
+    means neither tree has to arrange its PYTHONPATH a particular way.
+    """
+    import importlib
+    for name in ("opfdata_pipeline", "src.opfdata_pipeline"):
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError:
+            continue
+    raise ModuleNotFoundError(
+        "opfdata_pipeline not importable as either 'opfdata_pipeline' or "
+        "'src.opfdata_pipeline'. Put the directory holding it, or its parent, "
+        "on PYTHONPATH.")
+
+
 def _branch_admittance(r, x, b_fr, b_to, tap, shift):
     """MATPOWER branch model, matching `opfdata_pipeline.build_ybus` exactly.
 
@@ -183,7 +204,8 @@ def graphkit_branch_edges(hetero, device, dtype=torch.float32
     equivariant over edges -- so reordering changes no base result. Only CoED,
     which indexes theta positionally, depends on it.
     """
-    from opfdata_pipeline import AC_LINE, TRAFO
+    _p = _opfdata_pipeline()
+    AC_LINE, TRAFO = _p.AC_LINE, _p.TRAFO
 
     # Accumulated separately so the two halves can be concatenated in the
     # contiguous order; appending per relation would interleave them.
@@ -303,7 +325,7 @@ def to_graphkit_batch(batch: Dict[str, torch.Tensor], device,
                       feature_transform: str = "signed_log"):
     """OPFData batch -> the HeteroData the released model's `forward` expects."""
     from torch_geometric.data import HeteroData
-    from opfdata_pipeline import to_gridfm_inputs
+    to_gridfm_inputs = _opfdata_pipeline().to_gridfm_inputs
 
     # Bus/gen features are already in gridfm_graphkit's exact column layout.
     x_dict, ei_dict, _ = to_gridfm_inputs(batch, device, feature_transform)
